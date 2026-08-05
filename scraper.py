@@ -257,7 +257,7 @@ def search_plans(cep: str, number: str) -> dict:
 
     has_claro = cep_has_coverage(cep_clean, "ceps_claro")
     has_tim = cep_has_coverage(cep_clean, "ceps_tim")
-    nio_coverage = cep_has_coverage(cep_clean, "ceps_nio") if _is_rj_cep(cep_clean) else False
+    nio_coverage = cep_has_coverage(cep_clean, "ceps_nio")
 
     if not has_claro and not has_tim and not nio_coverage:
         return {"error": "CEP sem cobertura", "plans": []}
