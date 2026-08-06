@@ -1,7 +1,7 @@
 """
 Coverage checker and plan provider.
 Coverage is resolved from Postgres tables (populated via seed_db.py and sync_nio_ceps.py).
-Address/city resolution uses the public ViaCEP API.
+Address/city resolution uses the public OpenCEP API.
 """
 
 import json
@@ -24,16 +24,26 @@ def _normalize(text: str) -> str:
 def _is_rj_cep(cep: str) -> bool:
     """RJ state CEPs range from 20000-000 to 28999-999."""
     try:
-        return RJ_CEP_MIN <= int(re.sub(r"\D", "", cep)) <= RJ_CEP_MAX
+        return RJ_CEP_MIN <= int(cep) <= RJ_CEP_MAX
     except ValueError:
         return False
 
 
+def _clean_cep(cep: str) -> str:
+    """Remove all non-digit characters and zero-pad to 8 digits."""
+    digits = re.sub(r"\D", "", cep)
+    return digits.zfill(8)
+
+
 def _fetch_address(cep: str) -> dict:
-    """Resolve CEP to address via OpenCEP. Returns empty strings on failure."""
-    url = f"https://opencep.com/v1/{cep}"
+    """Resolve CEP to address via OpenCEP. Returns empty strings on failure.
+    Accepts CEP with or without hyphen; formats for API call."""
+    # OpenCEP accepts both formats, but format with hyphen for consistency
+    cep_digits = _clean_cep(cep)
+    cep_formatted = f"{cep_digits[:5]}-{cep_digits[5:]}"
+    url = f"https://opencep.com/v1/{cep_formatted}"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "mcc-back/2.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "mcc-back/2.1"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         if not data or data.get("erro") or data.get("error"):
@@ -251,7 +261,7 @@ NIO_PLANS = [
 
 def search_plans(cep: str, number: str) -> dict:
     """Resolve coverage from Postgres + static plan cards."""
-    cep_clean = re.sub(r"\D", "", cep)
+    cep_clean = _clean_cep(cep)
     if len(cep_clean) != 8:
         return {"error": "CEP deve ter 8 dígitos", "plans": []}
 
@@ -329,13 +339,13 @@ def _build_coverage_string(
 
 def get_coverage_string(cep: str, number: str) -> str:
     """Return a human-readable coverage string for the given address."""
-    cep_clean = re.sub(r"\D", "", cep)
+    cep_clean = _clean_cep(cep)
     if len(cep_clean) != 8:
         return "Sem cobertura"
 
     has_claro = cep_has_coverage(cep_clean, "ceps_claro")
     has_tim = cep_has_coverage(cep_clean, "ceps_tim")
-    nio_coverage = cep_has_coverage(cep_clean, "ceps_nio") if _is_rj_cep(cep_clean) else False
+    nio_coverage = cep_has_coverage(cep_clean, "ceps_nio")
 
     city_normalized = ""
     if has_claro:
