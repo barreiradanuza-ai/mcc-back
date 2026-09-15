@@ -7,6 +7,7 @@ its virtualized list, unions all CEPs, and atomically replaces ceps_nio.
 """
 
 import asyncio
+import csv
 import os
 import re
 import sys
@@ -31,6 +32,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 HEADLESS = os.getenv("NIO_HEADLESS", "true").lower() != "false"
 CEP_PATTERN = re.compile(r"^\d{8}$")
 MAX_IDLE_SCROLLS = 15
+OUTPUT_CSV = os.getenv("NIO_OUTPUT_CSV", "ceps_nio_novos.csv")
+EXPORT_ONLY = os.getenv("NIO_EXPORT_ONLY", "false").lower() == "true"
+TEST_STATES = tuple(s.strip().upper() for s in os.getenv("NIO_TEST_STATES", "").split(",") if s.strip())
+BRAZIL_STATES = tuple("AC AL AP AM BA CE DF ES GO MA MT MS MG PA PB PR PE PI RJ RN RS RO RR SC SP SE TO".split())
 
 
 async def _wait_for_report(page):
@@ -74,7 +79,7 @@ async def _select_partner(page):
 
 async def _login(page, report_url: str) -> bool:
     print(f"[sync] Navigating to regional Power BI report: {report_url[-24:]}")
-    await page.goto(report_url, wait_until="networkidle", timeout=90000)
+    await page.goto(report_url, wait_until="domcontentloaded", timeout=90000)
     await _wait_for_report(page)
 
     body = await page.inner_text("body")
@@ -102,6 +107,67 @@ async def _clear_report_filters(page):
         await clear_button.first.click()
         print("[sync] Cleared default regional report filters")
         await page.wait_for_timeout(10000)
+
+
+async def _select_state(page, state: str) -> bool:
+    """Select one UF in the report so querydata stays below Power BI limits."""
+    uf = page.locator("div.slicer-dropdown-menu[aria-label='UF']")
+    if not await uf.count() or not await uf.last.is_visible():
+        return False
+    await uf.last.click()
+    await page.wait_for_timeout(1000)
+    candidates = page.get_by_text(state, exact=True)
+    for i in range(await candidates.count()):
+        candidate = candidates.nth(i)
+        if await candidate.is_visible():
+            await candidate.click()
+            await page.wait_for_timeout(8000)
+            print(f"[sync] Selected UF {state}")
+            return True
+    await page.keyboard.press("Escape")
+    print(f"[sync] UF {state} not available in this regional report")
+    return False
+
+
+def _extract_ceps_from_querydata(body: bytes) -> set[str]:
+    """Extract literal CEP strings only from a response selecting BASE_HP_F.CEP."""
+    text = body.decode("utf-8", errors="ignore")
+    if '"Name":"BASE_HP_F.CEP"' not in text and '"Name": "BASE_HP_F.CEP"' not in text:
+        return set()
+    return {
+        value
+        for value in re.findall(r"(?<!\d)\d{8}(?!\d)", text)
+        if CEP_PATTERN.fullmatch(value)
+    }
+
+
+async def _collect_querydata_by_state(page, states: tuple[str, ...]) -> set[str]:
+    """Intercept querydata responses while selecting each UF."""
+    captured: set[str] = set()
+    response_count = 0
+
+    async def on_response(response):
+        nonlocal response_count
+        if "querydata" not in response.url.lower():
+            return
+        try:
+            response_count += 1
+            values = _extract_ceps_from_querydata(await response.body())
+            if values:
+                captured.update(values)
+                print(f"[sync] querydata captured +{len(values)} CEPs (total: {len(captured)})")
+        except Exception as exc:
+            print(f"[sync] querydata response ignored: {exc}")
+
+    page.on("response", on_response)
+    try:
+        for state in states:
+            if await _select_state(page, state):
+                await page.wait_for_timeout(5000)
+    finally:
+        page.remove_listener("response", on_response)
+    print(f"[sync] querydata responses inspected: {response_count}; CEPs: {len(captured)}")
+    return captured
 
 
 async def _open_cep_slicer(page):
@@ -146,6 +212,11 @@ async def _collect_all_ceps(page) -> set[str]:
     """Open the CEP slicer and scroll through collecting all visible CEPs."""
     await _clear_report_filters(page)
     cep_dropdown = await _open_cep_slicer(page)
+    states = TEST_STATES or BRAZIL_STATES
+    querydata_ceps = await _collect_querydata_by_state(page, states)
+    if querydata_ceps:
+        print(f"[sync] Regional querydata extraction collected {len(querydata_ceps)} unique CEPs")
+        return querydata_ceps
     await cep_dropdown.click()
     await page.wait_for_timeout(5000)
 
@@ -254,12 +325,26 @@ def save_to_db(ceps: set[str]):
         conn.close()
 
 
+def write_ceps_csv(ceps: set[str], path: str = OUTPUT_CSV) -> None:
+    """Write only the validated, unique CEP column for manual import."""
+    normalized = sorted({cep for cep in ceps if CEP_PATTERN.fullmatch(cep)})
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["CEP"])
+        writer.writerows((cep,) for cep in normalized)
+    print(f"[sync] Wrote {len(normalized)} validated unique CEPs to {path}")
+
+
 def main():
     print(f"[sync] Starting Nio CEP sync at {datetime.now(timezone.utc).isoformat()}")
     ceps = asyncio.run(scrape_nio_ceps())
+    write_ceps_csv(ceps)
     if not ceps:
         print("[sync] No CEPs collected — aborting DB write to avoid wiping table.")
         sys.exit(1)
+    if EXPORT_ONLY:
+        print("[sync] Export-only mode enabled; database was not modified.")
+        return
     save_to_db(ceps)
     print(f"[sync] Done. {len(ceps)} CEPs synced.")
 
