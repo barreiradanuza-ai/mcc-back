@@ -1,0 +1,10 @@
+# Use this file as the configuration for a second Railway service created from mcc-back.
+# The web API keeps railway.toml; this service runs and exits after each refresh.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -u run_nio_refresh.py"
+cronSchedule = "0 3 1,15 * *"
+restartPolicyType = "never"
