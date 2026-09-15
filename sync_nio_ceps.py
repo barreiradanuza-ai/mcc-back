@@ -161,14 +161,15 @@ def _decode_dsr_cell(value, dictionaries: dict):
     return value
 
 
-def _extract_ceps_from_querydata(payload: dict) -> set[str]:
-    """Decode CEP values only from DSR responses selecting BASE_HP_F.CEP."""
+def _extract_column_from_querydata(payload: dict, wanted_name: str,
+                                   pattern: re.Pattern[str] | None = None) -> set[str]:
+    """Decode one selected column from a DSR response."""
     data = payload.get("results", [{}])[0].get("result", {}).get("data", {})
     selects = data.get("descriptor", {}).get("Select", []) or []
-    cep_indexes = [i for i, item in enumerate(selects) if item.get("Name") == "BASE_HP_F.CEP"]
-    if not cep_indexes:
+    indexes = [i for i, item in enumerate(selects) if item.get("Name") == wanted_name]
+    if not indexes:
         return set()
-    cep_index = cep_indexes[0]
+    column_index = indexes[0]
     dictionaries = _value_dicts(payload)
     found: set[str] = set()
     previous: list = []
@@ -177,11 +178,11 @@ def _extract_ceps_from_querydata(payload: dict) -> set[str]:
         for phase in dataset.get("PH", []) or []:
             for block_name in ("DM0", "DM1"):
                 for row in phase.get(block_name, []) or []:
-                    direct_value = row.get(f"G{cep_index}")
+                    direct_value = row.get(f"G{column_index}")
                     if isinstance(direct_value, str):
-                        digits = re.sub(r"\D", "", direct_value)
-                        if CEP_PATTERN.fullmatch(digits):
-                            found.add(digits)
+                        normalized = re.sub(r"\D", "", direct_value) if pattern == CEP_PATTERN else direct_value.strip().upper()
+                        if pattern is None or pattern.fullmatch(normalized):
+                            found.add(normalized)
                         continue
                     cells = row.get("C", [])
                     repeat_mask = row.get("R", 0)
@@ -195,15 +196,19 @@ def _extract_ceps_from_querydata(payload: dict) -> set[str]:
                             cell_pos += 1
                         decoded.append(_decode_dsr_cell(value, dictionaries))
                     previous = decoded
-                    value = decoded[cep_index] if cep_index < len(decoded) else None
+                    value = decoded[column_index] if column_index < len(decoded) else None
                     if isinstance(value, str):
-                        digits = re.sub(r"\D", "", value)
-                        if CEP_PATTERN.fullmatch(digits):
-                            found.add(digits)
+                        normalized = re.sub(r"\D", "", value) if pattern == CEP_PATTERN else value.strip().upper()
+                        if pattern is None or pattern.fullmatch(normalized):
+                            found.add(normalized)
     return found
 
 
-async def _collect_querydata_by_state(page, states: tuple[str, ...], audit: list[dict]) -> set[str]:
+def _extract_ceps_from_querydata(payload: dict) -> set[str]:
+    return _extract_column_from_querydata(payload, "BASE_HP_F.CEP", CEP_PATTERN)
+
+
+async def _collect_querydata_by_state(page, states: tuple[str, ...], audit: list[dict], progress=None) -> set[str]:
     """Intercept querydata responses while selecting each UF."""
     captured: set[str] = set()
     response_count = 0
@@ -251,7 +256,7 @@ async def _collect_querydata_by_state(page, states: tuple[str, ...], audit: list
         if request_info:
             for state in states:
                 if state in ADAPTIVE_STATES:
-                    captured.update(await _collect_adaptive_state(page, request_info, state, audit))
+                    captured.update(await _collect_hierarchical_state(page, request_info, state, audit, progress))
                 else:
                     values = await _query_cep_only(page, request_info, state)
                     captured.update(values)
@@ -298,9 +303,88 @@ def _make_cep_query(template: dict, state: str, start: int | None = None,
     return body
 
 
-async def _query_cep_only(page, request_info: dict, state: str,
-                          start: int | None = None, end: int | None = None) -> set[str]:
-    body = _make_cep_query(request_info["body"], state, start, end)
+def _in_condition(source: str, property_name: str, value: str) -> dict:
+    return {"Condition": {"In": {
+        "Expressions": [{"Column": {"Expression": {"SourceRef": {"Source": source}}, "Property": property_name}}],
+        "Values": [[{"Literal": {"Value": f"'{value.replace(chr(39), chr(39) * 2)}'"}}]],
+    }}}
+
+
+def _make_filtered_query(template: dict, select_property: str, select_name: str,
+                         filters: dict[str, str]) -> dict:
+    body = __import__("copy").deepcopy(template)
+    command = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]
+    query = command["Query"]
+    query["Select"] = [{"Column": {"Expression": {"SourceRef": {"Source": "b"}}, "Property": select_property},
+                         "Name": select_name, "NativeReferenceName": select_property}]
+    query["Where"] = [_in_condition("b", key, value) for key, value in filters.items()]
+    command["Binding"] = {
+        "Primary": {"Groupings": [{"Projections": [0], "Subtotal": 1}]},
+        "DataReduction": {"DataVolume": 3, "Primary": {"Window": {"Count": 30000}}},
+    }
+    return body
+
+
+async def _query_column(page, request_info: dict, property_name: str,
+                        filters: dict[str, str]) -> set[str]:
+    body = _make_filtered_query(request_info["body"], property_name, f"BASE_HP_F.{property_name}", filters)
+    result = await page.evaluate("""async ({url, headers, body}) => {
+        const safe = {};
+        for (const [key, value] of Object.entries(headers)) {
+            if (!['content-length', 'host', 'cookie'].includes(key.toLowerCase())) safe[key] = value;
+        }
+        const response = await fetch(url, {method: 'POST', headers: safe, body: JSON.stringify(body)});
+        return {status: response.status, text: await response.text()};
+    }""", {"url": request_info["url"], "headers": request_info["headers"], "body": body})
+    if result["status"] != 200:
+        print(f"[sync] Categorical query {property_name} returned HTTP {result['status']}")
+        return set()
+    payload = json.loads(result["text"])
+    return _extract_column_from_querydata(payload, f"BASE_HP_F.{property_name}")
+
+
+async def _collect_hierarchical_state(page, request_info: dict, state: str,
+                                      audit: list[dict], progress=None) -> set[str]:
+    """Collect PR/RS by municipality, then finer dimensions when a partition hits the limit."""
+    async def collect_partition(filters: dict[str, str], fields: tuple[str, ...]) -> set[str]:
+        values = await _query_cep_only(page, request_info, state, filters=filters)
+        if len(values) < ADAPTIVE_LIMIT:
+            return values
+        if not fields:
+            audit.append({"state": state, "filters": filters, "field": None,
+                          "count": len(values), "truncated": True,
+                          "status": "failed-no-finer-dimension"})
+            return values
+        field = fields[0]
+        children = sorted(await _query_column(page, request_info, field, filters))
+        split_values: set[str] = set()
+        for child in children:
+            child_values = await collect_partition({**filters, field: child}, fields[1:])
+            audit.append({"state": state, "filters": {**filters, field: child},
+                          "field": field, "value": child, "count": len(child_values),
+                          "truncated": len(child_values) >= ADAPTIVE_LIMIT})
+            split_values.update(child_values)
+        return split_values
+
+    municipalities = sorted(await _query_column(page, request_info, "MUNICIPIO", {"UF": state}))
+    all_ceps: set[str] = set()
+    total = len(municipalities)
+    for index, municipality in enumerate(municipalities, 1):
+        filters = {"UF": state, "MUNICIPIO": municipality}
+        values = await collect_partition(filters, ("BAIRRO", "LOGRADOURO", "CODIGO_LOGRADOURO", "CODIGO_CDO"))
+        audit.append({"state": state, "municipio": municipality, "field": "MUNICIPIO",
+                      "count": len(values), "truncated": len(values) >= ADAPTIVE_LIMIT})
+        all_ceps.update(values)
+        if progress:
+            progress(state, index, total, municipality, len(all_ceps))
+    return all_ceps
+
+
+async def _query_cep_only(page, request_info: dict, state: str | None,
+                          start: int | None = None, end: int | None = None,
+                          filters: dict[str, str] | None = None) -> set[str]:
+    body = (_make_filtered_query(request_info["body"], "CEP", "BASE_HP_F.CEP", filters)
+            if filters is not None else _make_cep_query(request_info["body"], state, start, end))
     collected: set[str] = set()
     page_number = 0
     while page_number < 200:
@@ -424,12 +508,12 @@ async def _collect_from_table(page) -> set[str]:
     return {cep for cep in collected if CEP_PATTERN.match(cep)}
 
 
-async def _collect_all_ceps(page, audit: list[dict]) -> set[str]:
+async def _collect_all_ceps(page, audit: list[dict], progress=None) -> set[str]:
     """Open the CEP slicer and scroll through collecting all visible CEPs."""
     await _clear_report_filters(page)
     cep_dropdown = await _open_cep_slicer(page)
     states = TEST_STATES or BRAZIL_STATES
-    querydata_ceps = await _collect_querydata_by_state(page, states, audit)
+    querydata_ceps = await _collect_querydata_by_state(page, states, audit, progress)
     if querydata_ceps:
         print(f"[sync] Regional querydata extraction collected {len(querydata_ceps)} unique CEPs")
         return querydata_ceps
@@ -479,7 +563,7 @@ async def _collect_all_ceps(page, audit: list[dict]) -> set[str]:
     return collected
 
 
-async def scrape_nio_ceps(audit: list[dict]) -> set[str]:
+async def scrape_nio_ceps(audit: list[dict], progress=None) -> set[str]:
     """Collect and union CEPs from all four regional reports."""
     all_ceps: set[str] = set()
     async with async_playwright() as p:
@@ -491,7 +575,7 @@ async def scrape_nio_ceps(audit: list[dict]) -> set[str]:
             for report_url in POWERBI_URLS:
                 try:
                     if await _login(page, report_url):
-                        all_ceps.update(await _collect_all_ceps(page, audit))
+                        all_ceps.update(await _collect_all_ceps(page, audit, progress))
                 except Exception as exc:
                     print(f"[sync] Regional report failed: {exc}")
                 await page.goto("about:blank")
@@ -591,8 +675,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-

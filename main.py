@@ -60,7 +60,11 @@ async def _run_nio_job(job_id: str):
         job.update(status="running", phase="Consultando Power BI regional",
                    started_at=datetime.now(timezone.utc).isoformat())
         audit: list[dict] = []
-        ceps = await scrape_nio_ceps(audit)
+        def progress(state, current, total, municipality, collected):
+            job.update(collected=collected)
+            job.update(progress={"state": state, "current": current, "total": total,
+                                 "municipality": municipality, "collected": collected})
+        ceps = await scrape_nio_ceps(audit, progress)
         job.update(phase="Validando CEPs e auditoria", collected=len(ceps))
         folder = EXPORT_ROOT / job_id
         folder.mkdir(parents=True, exist_ok=True)
@@ -87,6 +91,7 @@ async def start_nio_export():
         return _public_job(active)
     job_id = uuid.uuid4().hex
     job = {"id": job_id, "status": "queued", "phase": "Aguardando execução", "collected": 0,
+           "progress": {"state": None, "current": 0, "total": 0, "municipality": None, "collected": 0},
            "valid": False, "problems": [], "created_at": datetime.now(timezone.utc).isoformat()}
     NIO_JOBS[job_id] = job
     job["task"] = asyncio.create_task(_run_nio_job(job_id))
@@ -236,4 +241,3 @@ def get_coverage(
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
