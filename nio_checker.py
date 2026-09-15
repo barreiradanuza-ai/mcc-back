@@ -21,6 +21,27 @@ NIO_PASS_2 = "7791"
 HEADLESS = os.getenv("NIO_HEADLESS", "true").lower() != "false"
 
 
+async def _select_partner(page):
+    user_dropdown = page.locator("div.slicer-dropdown-menu").first
+    await user_dropdown.wait_for(state="visible", timeout=60000)
+    await user_dropdown.click()
+    partner_candidates = (
+        page.get_by_text("PARCEIRO", exact=True),
+        page.get_by_text(re.compile(r"^\s*PARCEIRO\s*$", re.IGNORECASE)),
+        page.locator("text=PARCEIRO"),
+    )
+    for partner in partner_candidates:
+        if await partner.count():
+            try:
+                await partner.first.wait_for(state="visible", timeout=15000)
+                await partner.first.click()
+                return
+            except Exception:
+                continue
+    body = (await page.inner_text("body"))[:500].replace("\n", " | ")
+    raise RuntimeError(f"PARCEIRO not found after opening user slicer: {body}")
+
+
 async def _check_nio_report(page, cep_clean: str, report_url: str) -> bool:
     await page.goto(report_url, wait_until="networkidle", timeout=90000)
 
@@ -30,19 +51,16 @@ async def _check_nio_report(page, cep_clean: str, report_url: str) -> bool:
         if "Loading data" not in body and "Carregando dados" not in body:
             break
 
-    user_dropdown = page.locator("div.slicer-dropdown-menu").first
-    await user_dropdown.click()
-    parceiro = page.get_by_text("PARCEIRO", exact=True)
-    await parceiro.first.wait_for(state="visible", timeout=5000)
-    await parceiro.first.click()
+    await _select_partner(page)
 
     visible_inputs = page.locator("input:visible")
-    await visible_inputs.first.wait_for(state="visible", timeout=5000)
+    await visible_inputs.first.wait_for(state="visible", timeout=30000)
     if await visible_inputs.count() < 2:
         return False
     await visible_inputs.nth(0).fill(NIO_PASS_1)
     await visible_inputs.nth(1).fill(NIO_PASS_2)
     await page.get_by_text("ENTRAR", exact=True).first.click()
+    await page.wait_for_timeout(10000)
 
     cep_dropdown = page.locator("div.slicer-dropdown-menu[aria-label='CEP']")
     for page_number in range(4):
