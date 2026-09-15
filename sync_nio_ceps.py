@@ -92,8 +92,16 @@ async def _login(page, report_url: str) -> bool:
     await visible_inputs.nth(0).fill(NIO_PASS_1)
     await visible_inputs.nth(1).fill(NIO_PASS_2)
     await page.get_by_text("ENTRAR", exact=True).first.click()
-    await page.wait_for_timeout(10000)
+    await page.wait_for_timeout(15000)
     return True
+
+
+async def _clear_report_filters(page):
+    clear_button = page.get_by_text("Limpar Filtros", exact=True)
+    if await clear_button.count() and await clear_button.first.is_visible():
+        await clear_button.first.click()
+        print("[sync] Cleared default regional report filters")
+        await page.wait_for_timeout(10000)
 
 
 async def _open_cep_slicer(page):
@@ -110,11 +118,36 @@ async def _open_cep_slicer(page):
     return cep_dropdown
 
 
+async def _prepare_table(page):
+    slider = page.locator('[role="slider"][aria-label="TopN_Parametro"]')
+    if await slider.count() and await slider.first.is_visible():
+        await slider.first.focus()
+        for _ in range(1000):
+            value = await slider.first.get_attribute("aria-valuenow")
+            if value and int(value) >= 1000:
+                break
+            await page.keyboard.press("ArrowRight")
+        print(f"[sync] Table row parameter: {await slider.first.get_attribute('aria-valuenow')}")
+        await page.wait_for_timeout(15000)
+
+
+async def _collect_from_table(page) -> set[str]:
+    await _prepare_table(page)
+    collected: set[str] = set()
+    grid_cells = page.locator("[role='gridcell']:visible")
+    for i in range(await grid_cells.count()):
+        text = (await grid_cells.nth(i).inner_text()).strip()
+        collected.update(re.findall(r"\b\d{8}\b", text))
+    print(f"[sync] Table fallback collected {len(collected)} unique CEPs")
+    return {cep for cep in collected if CEP_PATTERN.match(cep)}
+
+
 async def _collect_all_ceps(page) -> set[str]:
     """Open the CEP slicer and scroll through collecting all visible CEPs."""
+    await _clear_report_filters(page)
     cep_dropdown = await _open_cep_slicer(page)
     await cep_dropdown.click()
-    await page.wait_for_timeout(1500)
+    await page.wait_for_timeout(5000)
 
     search_input = page.locator("input[placeholder='Search']:visible")
     if await search_input.count() == 0:
@@ -153,6 +186,8 @@ async def _collect_all_ceps(page) -> set[str]:
         await page.mouse.wheel(0, 300)
         await page.wait_for_timeout(600)
 
+    if not collected:
+        collected = await _collect_from_table(page)
     print(f"[sync] Regional report done. Collected {len(collected)} unique CEPs")
     return collected
 
@@ -231,5 +266,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
