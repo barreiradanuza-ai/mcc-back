@@ -9,4 +9,4 @@ RUN playwright install --with-deps chromium
 
 COPY . .
 
-CMD sh -c 'python -u sync_nio_ceps.py 2>&1 & exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}'
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
