@@ -7,6 +7,7 @@ its virtualized list, unions all CEPs, and atomically replaces ceps_nio.
 """
 
 import asyncio
+import csv
 import os
 import re
 import sys
@@ -31,6 +32,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 HEADLESS = os.getenv("NIO_HEADLESS", "true").lower() != "false"
 CEP_PATTERN = re.compile(r"^\d{8}$")
 MAX_IDLE_SCROLLS = 15
+OUTPUT_CSV = os.getenv("NIO_OUTPUT_CSV", "ceps_nio_novos.csv")
+EXPORT_ONLY = os.getenv("NIO_EXPORT_ONLY", "false").lower() == "true"
 
 
 async def _wait_for_report(page):
@@ -254,18 +257,33 @@ def save_to_db(ceps: set[str]):
         conn.close()
 
 
+def write_ceps_csv(ceps: set[str], path: str = OUTPUT_CSV) -> None:
+    """Write only the validated, unique CEP column for manual import."""
+    normalized = sorted({cep for cep in ceps if CEP_PATTERN.fullmatch(cep)})
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["CEP"])
+        writer.writerows((cep,) for cep in normalized)
+    print(f"[sync] Wrote {len(normalized)} validated unique CEPs to {path}")
+
+
 def main():
     print(f"[sync] Starting Nio CEP sync at {datetime.now(timezone.utc).isoformat()}")
     ceps = asyncio.run(scrape_nio_ceps())
+    write_ceps_csv(ceps)
     if not ceps:
         print("[sync] No CEPs collected — aborting DB write to avoid wiping table.")
         sys.exit(1)
+    if EXPORT_ONLY:
+        print("[sync] Export-only mode enabled; database was not modified.")
+        return
     save_to_db(ceps)
     print(f"[sync] Done. {len(ceps)} CEPs synced.")
 
 
 if __name__ == "__main__":
     main()
+
 
 
 
