@@ -92,8 +92,16 @@ async def _login(page, report_url: str) -> bool:
     await visible_inputs.nth(0).fill(NIO_PASS_1)
     await visible_inputs.nth(1).fill(NIO_PASS_2)
     await page.get_by_text("ENTRAR", exact=True).first.click()
-    await page.wait_for_timeout(10000)
+    await page.wait_for_timeout(15000)
     return True
+
+
+async def _clear_report_filters(page):
+    clear_button = page.get_by_text("Limpar Filtros", exact=True)
+    if await clear_button.count() and await clear_button.first.is_visible():
+        await clear_button.first.click()
+        print("[sync] Cleared default regional report filters")
+        await page.wait_for_timeout(10000)
 
 
 async def _open_cep_slicer(page):
@@ -112,9 +120,10 @@ async def _open_cep_slicer(page):
 
 async def _collect_all_ceps(page) -> set[str]:
     """Open the CEP slicer and scroll through collecting all visible CEPs."""
+    await _clear_report_filters(page)
     cep_dropdown = await _open_cep_slicer(page)
     await cep_dropdown.click()
-    await page.wait_for_timeout(1500)
+    await page.wait_for_timeout(5000)
 
     search_input = page.locator("input[placeholder='Search']:visible")
     if await search_input.count() == 0:
