@@ -8,6 +8,7 @@ its virtualized list, unions all CEPs, and atomically replaces ceps_nio.
 
 import asyncio
 import csv
+import json
 import os
 import re
 import sys
@@ -33,7 +34,12 @@ HEADLESS = os.getenv("NIO_HEADLESS", "true").lower() != "false"
 CEP_PATTERN = re.compile(r"^\d{8}$")
 MAX_IDLE_SCROLLS = 15
 OUTPUT_CSV = os.getenv("NIO_OUTPUT_CSV", "ceps_nio_novos.csv")
+AUDIT_JSON = os.getenv("NIO_AUDIT_JSON", "ceps_nio_auditoria.json")
 EXPORT_ONLY = os.getenv("NIO_EXPORT_ONLY", "false").lower() == "true"
+TEST_STATES = tuple(s.strip().upper() for s in os.getenv("NIO_TEST_STATES", "").split(",") if s.strip())
+ADAPTIVE_STATES = {"PR", "RS"}
+ADAPTIVE_LIMIT = 29999
+BRAZIL_STATES = tuple("AC AL AP AM BA CE DF ES GO MA MT MS MG PA PB PR PE PI RJ RN RS RO RR SC SP SE TO".split())
 
 
 async def _wait_for_report(page):
@@ -77,7 +83,7 @@ async def _select_partner(page):
 
 async def _login(page, report_url: str) -> bool:
     print(f"[sync] Navigating to regional Power BI report: {report_url[-24:]}")
-    await page.goto(report_url, wait_until="networkidle", timeout=90000)
+    await page.goto(report_url, wait_until="domcontentloaded", timeout=90000)
     await _wait_for_report(page)
 
     body = await page.inner_text("body")
@@ -105,6 +111,279 @@ async def _clear_report_filters(page):
         await clear_button.first.click()
         print("[sync] Cleared default regional report filters")
         await page.wait_for_timeout(10000)
+
+
+async def _select_state(page, state: str) -> bool:
+    """Select one UF in the report so querydata stays below Power BI limits."""
+    uf = page.locator("div.slicer-dropdown-menu[aria-label='UF']")
+    if not await uf.count() or not await uf.last.is_visible():
+        return False
+    await uf.last.click()
+    await page.wait_for_timeout(1000)
+    candidates = page.get_by_text(state, exact=True)
+    for i in range(await candidates.count()):
+        candidate = candidates.nth(i)
+        if await candidate.is_visible():
+            await candidate.click()
+            await page.wait_for_timeout(8000)
+            print(f"[sync] Selected UF {state}")
+            return True
+    await page.keyboard.press("Escape")
+    print(f"[sync] UF {state} not available in this regional report")
+    return False
+
+
+def _value_dicts(payload: dict) -> dict:
+    data = payload.get("results", [{}])[0].get("result", {}).get("data", {})
+    dsr = data.get("dsr", {})
+    dictionaries = {}
+    dictionaries.update(dsr.get("ValueDicts", {}) or {})
+    for dataset in dsr.get("DS", []) or []:
+        dictionaries.update(dataset.get("ValueDicts", {}) or {})
+        for phase in dataset.get("PH", []) or []:
+            dictionaries.update(phase.get("ValueDicts", {}) or {})
+    return dictionaries
+
+
+def _decode_dsr_cell(value, dictionaries: dict):
+    if isinstance(value, dict):
+        if "D" in value:
+            value = value["D"]
+        elif "S" in value:
+            value = value["S"]
+    if isinstance(value, int):
+        # Power BI dictionaries are commonly keyed by the column/group name;
+        # support both a direct list and a dict containing a list.
+        for dictionary in dictionaries.values():
+            if isinstance(dictionary, list) and 0 <= value < len(dictionary):
+                return dictionary[value]
+        return value
+    return value
+
+
+def _extract_ceps_from_querydata(payload: dict) -> set[str]:
+    """Decode CEP values only from DSR responses selecting BASE_HP_F.CEP."""
+    data = payload.get("results", [{}])[0].get("result", {}).get("data", {})
+    selects = data.get("descriptor", {}).get("Select", []) or []
+    cep_indexes = [i for i, item in enumerate(selects) if item.get("Name") == "BASE_HP_F.CEP"]
+    if not cep_indexes:
+        return set()
+    cep_index = cep_indexes[0]
+    dictionaries = _value_dicts(payload)
+    found: set[str] = set()
+    previous: list = []
+    dsr = data.get("dsr", {})
+    for dataset in dsr.get("DS", []) or []:
+        for phase in dataset.get("PH", []) or []:
+            for block_name in ("DM0", "DM1"):
+                for row in phase.get(block_name, []) or []:
+                    direct_value = row.get(f"G{cep_index}")
+                    if isinstance(direct_value, str):
+                        digits = re.sub(r"\D", "", direct_value)
+                        if CEP_PATTERN.fullmatch(digits):
+                            found.add(digits)
+                        continue
+                    cells = row.get("C", [])
+                    repeat_mask = row.get("R", 0)
+                    decoded = []
+                    cell_pos = 0
+                    for col in range(len(selects)):
+                        if isinstance(repeat_mask, int) and (repeat_mask & (1 << col)):
+                            value = previous[col] if col < len(previous) else None
+                        else:
+                            value = cells[cell_pos] if cell_pos < len(cells) else None
+                            cell_pos += 1
+                        decoded.append(_decode_dsr_cell(value, dictionaries))
+                    previous = decoded
+                    value = decoded[cep_index] if cep_index < len(decoded) else None
+                    if isinstance(value, str):
+                        digits = re.sub(r"\D", "", value)
+                        if CEP_PATTERN.fullmatch(digits):
+                            found.add(digits)
+    return found
+
+
+async def _collect_querydata_by_state(page, states: tuple[str, ...], audit: list[dict]) -> set[str]:
+    """Intercept querydata responses while selecting each UF."""
+    captured: set[str] = set()
+    response_count = 0
+    request_info = None
+
+    async def on_request(request):
+        nonlocal request_info
+        if request_info or "querydata" not in request.url.lower():
+            return
+        try:
+            body = json.loads(request.post_data or "{}")
+            command = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]
+            names = [item.get("Name") for item in command["Query"].get("Select", [])]
+            if "BASE_HP_F.CEP" in names and len(names) > 5:
+                request_info = {"url": request.url, "headers": await request.all_headers(), "body": body}
+                print(f"[sync] Captured table query template with {len(names)} columns")
+        except Exception:
+            return
+
+    async def on_response(response):
+        nonlocal response_count
+        if "querydata" not in response.url.lower():
+            return
+        try:
+            response_count += 1
+            try:
+                payload = await response.json()
+            except Exception:
+                return
+            values = _extract_ceps_from_querydata(payload)
+            if values:
+                captured.update(values)
+                print(f"[sync] querydata captured +{len(values)} CEPs (total: {len(captured)})")
+        except Exception as exc:
+            print(f"[sync] querydata response ignored: {exc}")
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+    try:
+        for state in states:
+            if await _select_state(page, state):
+                await page.wait_for_timeout(5000)
+                if request_info:
+                    break
+        if request_info:
+            for state in states:
+                if state in ADAPTIVE_STATES:
+                    captured.update(await _collect_adaptive_state(page, request_info, state, audit))
+                else:
+                    values = await _query_cep_only(page, request_info, state)
+                    captured.update(values)
+                    audit.append({"state": state, "start": None, "end": None,
+                                  "count": len(values), "truncated": False,
+                                  "depth": None, "status": "state-query"})
+    finally:
+        page.remove_listener("request", on_request)
+        page.remove_listener("response", on_response)
+    print(f"[sync] querydata responses inspected: {response_count}; CEPs: {len(captured)}")
+    return captured
+
+
+def _make_cep_query(template: dict, state: str, start: int | None = None,
+                    end: int | None = None) -> dict:
+    """Reduce a captured visual query to CEP only and one UF."""
+    body = __import__("copy").deepcopy(template)
+    command = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]
+    query = command["Query"]
+    query["Select"] = [{
+        "Column": {"Expression": {"SourceRef": {"Source": "b"}}, "Property": "CEP"},
+        "Name": "BASE_HP_F.CEP",
+        "NativeReferenceName": "CEP",
+    }]
+    conditions = [{"Condition": {"In": {
+        "Expressions": [{"Column": {
+            "Expression": {"SourceRef": {"Source": "b"}}, "Property": "UF"
+        }}],
+        "Values": [[{"Literal": {"Value": f"'{state}'"}}]],
+    }}}] if state else []
+    if start is not None and end is not None:
+        cep_column = {"Column": {"Expression": {"SourceRef": {"Source": "b"}}, "Property": "CEP"}}
+        conditions.extend([
+            {"Condition": {"Comparison": {"ComparisonKind": 3,
+                "Left": cep_column, "Right": {"Literal": {"Value": f"'{start:08d}'"}}}}},
+            {"Condition": {"Comparison": {"ComparisonKind": 0,
+                "Left": cep_column, "Right": {"Literal": {"Value": f"'{end:08d}'"}}}}},
+        ])
+    query["Where"] = conditions
+    command["Binding"] = {
+        "Primary": {"Groupings": [{"Projections": [0], "Subtotal": 1}]},
+        "DataReduction": {"DataVolume": 3, "Primary": {"Window": {"Count": 30000}}},
+    }
+    return body
+
+
+async def _query_cep_only(page, request_info: dict, state: str,
+                          start: int | None = None, end: int | None = None) -> set[str]:
+    body = _make_cep_query(request_info["body"], state, start, end)
+    collected: set[str] = set()
+    page_number = 0
+    while page_number < 200:
+        result = await page.evaluate("""async ({url, headers, body}) => {
+        const safe = {};
+        for (const [key, value] of Object.entries(headers)) {
+            if (!['content-length', 'host', 'cookie'].includes(key.toLowerCase())) safe[key] = value;
+        }
+        const response = await fetch(url, {method: 'POST', headers: safe, body: JSON.stringify(body)});
+        return {status: response.status, text: await response.text()};
+        }""", {"url": request_info["url"], "headers": request_info["headers"], "body": body})
+        if result["status"] != 200:
+            print(f"[sync] CEP query UF {state} returned HTTP {result['status']}")
+            return collected
+        try:
+            payload = json.loads(result["text"])
+            values = _extract_ceps_from_querydata(payload)
+        except Exception as exc:
+            print(f"[sync] CEP query UF {state} decode failed: {exc}")
+            return collected
+        collected.update(values)
+        dsr = payload.get("results", [{}])[0].get("result", {}).get("data", {}).get("dsr", {})
+        phases = [phase for dataset in dsr.get("DS", []) or [] for phase in dataset.get("PH", []) or []]
+        restart_tokens = next((phase.get("RT") for phase in phases if phase.get("RT")), None)
+        page_number += 1
+        label = f"{state or 'regional'} {start:08d}-{end:08d}" if start is not None else (state or "regional")
+        print(f"[sync] CEP page {label} #{page_number}: +{len(values)} (total {len(collected)})"
+              f"; restart={'yes' if restart_tokens else 'no'}")
+        if not restart_tokens or not values:
+            return collected
+        command = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]
+        command["Binding"]["DataReduction"]["Primary"]["Window"] = {
+            "Count": 30000,
+            "RestartTokens": restart_tokens,
+        }
+    print(f"[sync] CEP query {state} stopped after pagination safety limit")
+    return collected
+
+
+def _adaptive_ranges(state: str) -> list[tuple[int, int]]:
+    if state == "PR":
+        return [(prefix * 1000000, (prefix + 1) * 1000000) for prefix in range(80, 88)]
+    if state == "RS":
+        return [(prefix * 1000000, (prefix + 1) * 1000000) for prefix in range(90, 100)]
+    return []
+
+
+async def _collect_adaptive_range(page, request_info: dict, state: str,
+                                  start: int, end: int, depth: int,
+                                  audit: list[dict]) -> set[str]:
+    values = await _query_cep_only(page, request_info, state, start, end)
+    truncated = len(values) >= ADAPTIVE_LIMIT
+    row = {"state": state, "start": f"{start:08d}", "end": f"{end:08d}",
+           "count": len(values), "truncated": truncated, "depth": depth,
+           "status": "split" if truncated else "complete"}
+    audit.append(row)
+    if not truncated:
+        return values
+    if end - start <= 1:
+        row["status"] = "failed-minimum-range"
+        raise RuntimeError(f"Faixa ainda truncada no menor intervalo: {state} {start}-{end}")
+    midpoint = start + (end - start) // 2
+    left = await _collect_adaptive_range(page, request_info, state, start, midpoint, depth + 1, audit)
+    right = await _collect_adaptive_range(page, request_info, state, midpoint, end, depth + 1, audit)
+    return left | right
+
+
+async def _collect_adaptive_state(page, request_info: dict, state: str,
+                                  audit: list[dict]) -> set[str]:
+    # CEP comparisons and UF predicates can suppress RestartTokens in this
+    # model. Query the regional context without rebuilding Where predicates,
+    # paginate with DSR RestartTokens, then partition CEPs locally by range.
+    regional = await _query_cep_only(page, request_info, None)
+    collected = {cep for cep in regional if _cep_state(cep) == state}
+    at_limit = len(collected) == ADAPTIVE_LIMIT
+    audit.append({"state": state, "start": None, "end": None,
+                  "count": len(collected), "truncated": at_limit,
+                  "depth": 0,
+                  "status": "limit-without-restart-token" if at_limit
+                  else "restart-token-paginated",
+                  "complete_confirmed": not at_limit})
+    print(f"[sync] Restart-token extraction UF {state}: {len(collected)} CEPs")
+    return collected
 
 
 async def _open_cep_slicer(page):
@@ -145,10 +424,15 @@ async def _collect_from_table(page) -> set[str]:
     return {cep for cep in collected if CEP_PATTERN.match(cep)}
 
 
-async def _collect_all_ceps(page) -> set[str]:
+async def _collect_all_ceps(page, audit: list[dict]) -> set[str]:
     """Open the CEP slicer and scroll through collecting all visible CEPs."""
     await _clear_report_filters(page)
     cep_dropdown = await _open_cep_slicer(page)
+    states = TEST_STATES or BRAZIL_STATES
+    querydata_ceps = await _collect_querydata_by_state(page, states, audit)
+    if querydata_ceps:
+        print(f"[sync] Regional querydata extraction collected {len(querydata_ceps)} unique CEPs")
+        return querydata_ceps
     await cep_dropdown.click()
     await page.wait_for_timeout(5000)
 
@@ -195,7 +479,7 @@ async def _collect_all_ceps(page) -> set[str]:
     return collected
 
 
-async def scrape_nio_ceps() -> set[str]:
+async def scrape_nio_ceps(audit: list[dict]) -> set[str]:
     """Collect and union CEPs from all four regional reports."""
     all_ceps: set[str] = set()
     async with async_playwright() as p:
@@ -207,7 +491,7 @@ async def scrape_nio_ceps() -> set[str]:
             for report_url in POWERBI_URLS:
                 try:
                     if await _login(page, report_url):
-                        all_ceps.update(await _collect_all_ceps(page))
+                        all_ceps.update(await _collect_all_ceps(page, audit))
                 except Exception as exc:
                     print(f"[sync] Regional report failed: {exc}")
                 await page.goto("about:blank")
@@ -267,10 +551,34 @@ def write_ceps_csv(ceps: set[str], path: str = OUTPUT_CSV) -> None:
     print(f"[sync] Wrote {len(normalized)} validated unique CEPs to {path}")
 
 
+def write_audit(audit: list[dict], path: str = AUDIT_JSON) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(audit, handle, ensure_ascii=False, indent=2)
+    print(f"[sync] Wrote audit report with {len(audit)} queries to {path}")
+
+
+def write_state_csv(ceps: set[str], state: str) -> None:
+    path = f"ceps_{state.lower()}.csv"
+    write_ceps_csv({cep for cep in ceps if _cep_state(cep) == state}, path)
+
+
+def _cep_state(cep: str) -> str | None:
+    n = int(cep)
+    if 80000000 <= n < 88000000:
+        return "PR"
+    if 90000000 <= n < 100000000:
+        return "RS"
+    return None
+
+
 def main():
     print(f"[sync] Starting Nio CEP sync at {datetime.now(timezone.utc).isoformat()}")
-    ceps = asyncio.run(scrape_nio_ceps())
+    audit: list[dict] = []
+    ceps = asyncio.run(scrape_nio_ceps(audit))
     write_ceps_csv(ceps)
+    write_audit(audit)
+    write_state_csv(ceps, "PR")
+    write_state_csv(ceps, "RS")
     if not ceps:
         print("[sync] No CEPs collected — aborting DB write to avoid wiping table.")
         sys.exit(1)
@@ -283,6 +591,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
