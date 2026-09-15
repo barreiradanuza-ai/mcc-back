@@ -10,3 +10,4 @@ RUN playwright install --with-deps chromium
 COPY . .
 
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
+

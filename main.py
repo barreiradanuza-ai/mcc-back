@@ -236,3 +236,4 @@ def get_coverage(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+

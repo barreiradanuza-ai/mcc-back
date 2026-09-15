@@ -167,3 +167,5 @@ def check_nio_coverage(cep: str) -> bool:
             import time
             time.sleep(3)
     return False
+
+
