@@ -25,21 +25,25 @@ async def _select_partner(page):
     user_dropdown = page.locator("div.slicer-dropdown-menu").first
     await user_dropdown.wait_for(state="visible", timeout=60000)
     await user_dropdown.click()
-    partner_candidates = (
-        page.get_by_text("PARCEIRO", exact=True),
-        page.get_by_text(re.compile(r"^\s*PARCEIRO\s*$", re.IGNORECASE)),
-        page.locator("text=PARCEIRO"),
-    )
-    for partner in partner_candidates:
-        if await partner.count():
+    user_candidates = ("PILOTO", "Todos", "PARCEIRO")
+    for user_name in user_candidates:
+        candidates = (
+            page.get_by_text(user_name, exact=True),
+            page.get_by_text(re.compile(rf"^\s*{re.escape(user_name)}\s*$", re.IGNORECASE)),
+            page.locator(f"text={user_name}"),
+        )
+        for partner in candidates:
+            if not await partner.count():
+                continue
             try:
                 await partner.first.wait_for(state="visible", timeout=15000)
                 await partner.first.click()
+                print(f"[nio] Selected Nio user option: {user_name}")
                 return
             except Exception:
                 continue
     body = (await page.inner_text("body"))[:500].replace("\n", " | ")
-    raise RuntimeError(f"PARCEIRO not found after opening user slicer: {body}")
+    raise RuntimeError(f"No supported Nio user option found after opening user slicer: {body}")
 
 
 async def _check_nio_report(page, cep_clean: str, report_url: str) -> bool:
@@ -163,4 +167,5 @@ def check_nio_coverage(cep: str) -> bool:
             import time
             time.sleep(3)
     return False
+
 
