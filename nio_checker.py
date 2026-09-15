@@ -8,17 +8,83 @@ import os
 import re
 from playwright.async_api import async_playwright
 
-POWERBI_URL = (
-    "https://app.powerbi.com/view?r="
-    "eyJrIjoiOGE5ZGI4ZjktN2NmMS00ZGI1LTkwZDItNTI1OWFkMTQ5ZWJhIiwidCI6"
-    "Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9"
-    "&disablecdnExpiration=1769028883"
+POWERBI_URLS = (
+    "https://app.powerbi.com/view?r=eyJrIjoiYTUyMGYwNmUtYzdjZS00OTJmLWIyMTctMjVkNTI0MjM2YTExIiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
+    "https://app.powerbi.com/view?r=eyJrIjoiYTMyMWI0MDQtODE4Ni00NjQ1LTgwNzAtNTA3YThmZWE2YWJiIiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
+    "https://app.powerbi.com/view?r=eyJrIjoiY2MyMTJjMjUtMWI2YS00MzAxLTg3N2ItNzAzZTJjN2FhNzg4IiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
+    "https://app.powerbi.com/view?r=eyJrIjoiODFlOTVjMWEtZTc3MC00NGUzLTk2NDYtMTlkZjg0NDM3NTZjIiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
 )
 
 NIO_PASS_1 = "6566"
 NIO_PASS_2 = "7791"
 
 HEADLESS = os.getenv("NIO_HEADLESS", "true").lower() != "false"
+
+
+async def _check_nio_report(page, cep_clean: str, report_url: str) -> bool:
+    await page.goto(report_url, wait_until="networkidle", timeout=90000)
+
+    for _ in range(15):
+        await page.wait_for_timeout(2000)
+        body = await page.inner_text("body")
+        if "Loading data" not in body and "Carregando dados" not in body:
+            break
+
+    user_dropdown = page.locator("div.slicer-dropdown-menu").first
+    await user_dropdown.click()
+    parceiro = page.get_by_text("PARCEIRO", exact=True)
+    await parceiro.first.wait_for(state="visible", timeout=5000)
+    await parceiro.first.click()
+
+    visible_inputs = page.locator("input:visible")
+    await visible_inputs.first.wait_for(state="visible", timeout=5000)
+    if await visible_inputs.count() < 2:
+        return False
+    await visible_inputs.nth(0).fill(NIO_PASS_1)
+    await visible_inputs.nth(1).fill(NIO_PASS_2)
+    await page.get_by_text("ENTRAR", exact=True).first.click()
+
+    cep_dropdown = page.locator("div.slicer-dropdown-menu[aria-label='CEP']")
+    for page_number in range(4):
+        if await cep_dropdown.count() and await cep_dropdown.first.is_visible():
+            break
+        next_page = page.get_by_role("button", name="Próxima Página")
+        if page_number == 3 or not await next_page.count():
+            await cep_dropdown.wait_for(state="visible", timeout=30000)
+            break
+        await next_page.click()
+        await page.wait_for_timeout(5000)
+
+    await cep_dropdown.click()
+    search_input = page.locator("input[placeholder='Search']:visible")
+    if await search_input.count() == 0:
+        search_input = page.locator("input.searchInput:visible")
+    await search_input.first.wait_for(state="visible", timeout=5000)
+    await search_input.first.fill("")
+    await search_input.first.type(cep_clean, delay=80)
+
+    for _ in range(16):
+        await page.wait_for_timeout(500)
+        if await page.locator(".slicerText:visible").count() > 0:
+            break
+        if await page.get_by_text("Nenhum resultado encontrado").count() > 0:
+            return False
+
+    input_box = await search_input.first.bounding_box()
+    wheel_x = (input_box["x"] + input_box["width"] / 2) if input_box else 640
+    wheel_y = (input_box["y"] + input_box["height"] + 80) if input_box else 500
+    for attempt in range(6):
+        slicer_texts = page.locator(".slicerText:visible")
+        for i in range(await slicer_texts.count()):
+            if (await slicer_texts.nth(i).inner_text()).strip() == cep_clean:
+                return True
+        if await page.get_by_text("Nenhum resultado encontrado").count() > 0:
+            return False
+        if attempt < 5:
+            await page.mouse.move(wheel_x, wheel_y)
+            await page.mouse.wheel(0, 200)
+            await page.wait_for_timeout(1200)
+    return False
 
 
 async def _check_nio_async(cep: str) -> bool:
@@ -34,145 +100,17 @@ async def _check_nio_async(cep: str) -> bool:
         )
 
         try:
-            await page.goto(POWERBI_URL, wait_until="networkidle", timeout=90000)
-
-            for _ in range(15):
-                await page.wait_for_timeout(2000)
-                body = await page.inner_text("body")
-                if "Loading data" not in body:
-                    break
-
-            # Step 1: Select PARCEIRO from the user dropdown (first slicer)
-            user_dropdown = page.locator("div.slicer-dropdown-menu").first
-            await user_dropdown.click()
-
-            parceiro = page.get_by_text("PARCEIRO", exact=True)
-            try:
-                await parceiro.first.wait_for(state="visible", timeout=5000)
-            except Exception:
-                await browser.close()
-                return False
-            await parceiro.first.click()
-
-            # Step 2: Fill Senha 1 and Senha 2 — wait for inputs to appear first
-            visible_inputs = page.locator("input:visible")
-            try:
-                await visible_inputs.first.wait_for(state="visible", timeout=5000)
-            except Exception:
-                await browser.close()
-                return False
-
-            if await visible_inputs.count() < 2:
-                await browser.close()
-                return False
-
-            await visible_inputs.nth(0).click()
-            await visible_inputs.nth(0).fill(NIO_PASS_1)
-            await visible_inputs.nth(1).click()
-            await visible_inputs.nth(1).fill(NIO_PASS_2)
-
-            # Step 3: Click ENTRAR — wait for the button to be enabled/visible first
-            entrar = page.get_by_text("ENTRAR", exact=True)
-            try:
-                await entrar.first.wait_for(state="visible", timeout=3000)
-            except Exception:
-                await browser.close()
-                return False
-            await entrar.first.click()
-            # Wait until the CEP slicer is visible — dashboard is ready
-            cep_dropdown = page.locator("div.slicer-dropdown-menu[aria-label='CEP']")
-            try:
-                await cep_dropdown.wait_for(state="visible", timeout=15000)
-            except Exception:
-                await browser.close()
-                return False
-
-            # Step 4: Open the CEP slicer dropdown
-            if await cep_dropdown.count() == 0:
-                await browser.close()
-                return False
-            await cep_dropdown.click()
-
-            # Step 5: Type CEP in the search field — wait for it to appear
-            search_input = page.locator("input[placeholder='Search']:visible")
-            try:
-                await search_input.first.wait_for(state="visible", timeout=5000)
-            except Exception:
-                search_input = page.locator("input.searchInput:visible")
+            for report_url in POWERBI_URLS:
                 try:
-                    await search_input.first.wait_for(state="visible", timeout=3000)
-                except Exception:
-                    await browser.close()
-                    return False
-
-            # Click to focus, then type char-by-char to trigger Power BI's live filter
-            await search_input.first.click()
-            await search_input.first.fill("")
-            await page.wait_for_timeout(200)
-            await search_input.first.type(cep_clean, delay=80)
-
-            # Wait for the slicer filter to stabilize instead of a fixed delay.
-            # Power BI's async filter may still be showing stale items right after
-            # typing, so we wait until the visible count is stable across 2 reads.
-            prev_count = -1
-            for _ in range(16):
-                await page.wait_for_timeout(500)
-                cur_count = await page.locator(".slicerText:visible").count()
-                no_results = await page.get_by_text("Nenhum resultado encontrado").count() > 0
-                if no_results:
-                    break
-                if cur_count == prev_count:
-                    break
-                prev_count = cur_count
-
-            # Step 6: Check the filtered list.
-            # PowerBI's slicer uses virtualized rendering — the DOM only populates
-            # items after a real wheel event is received. We do up to 5 wheel
-            # triggers to coax the list into rendering, then stop.
-            input_box = await search_input.first.bounding_box()
-            wheel_x = (input_box["x"] + input_box["width"] / 2) if input_box else 640
-            wheel_y = (input_box["y"] + input_box["height"] + 80) if input_box else 500
-
-            found = False
-            items_seen_once = False
-            for attempt in range(6):
-                slicer_texts = page.locator(".slicerText:visible")
-                count = await slicer_texts.count()
-
-                for i in range(count):
-                    text = (await slicer_texts.nth(i).inner_text()).strip()
-                    if text == cep_clean:
-                        found = True
-                        break
-
-                print(
-                    f"[Nio] attempt {attempt}: {count} item(s) visible, found={found}"
-                )
-
-                if found:
-                    break
-
-                if await page.get_by_text("Nenhum resultado encontrado").count() > 0:
-                    print("[Nio] 'Nenhum resultado encontrado' — CEP not in coverage")
-                    break
-
-                # Items appeared but CEP not among them: wait and re-check once
-                # to handle stale/residual items from before the filter completed.
-                if count > 0:
-                    if items_seen_once:
-                        break
-                    items_seen_once = True
-                    await page.wait_for_timeout(1500)
-                    continue
-
-                # Nothing rendered yet: send a wheel event to trigger virtual list render
-                if attempt < 5:
-                    await page.mouse.move(wheel_x, wheel_y)
-                    await page.mouse.wheel(0, 200)
-                    await page.wait_for_timeout(1200)
+                    if await _check_nio_report(page, cep_clean, report_url):
+                        await browser.close()
+                        return True
+                except Exception as exc:
+                    print(f"[Nio] report failed: {exc}")
+                await page.goto("about:blank")
 
             await browser.close()
-            return found
+            return False
 
         except Exception as exc:
             print(f"[Nio] unexpected error: {exc}")
