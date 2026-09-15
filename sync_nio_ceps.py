@@ -77,6 +77,11 @@ async def _login(page, report_url: str) -> bool:
     await page.goto(report_url, wait_until="networkidle", timeout=90000)
     await _wait_for_report(page)
 
+    body = await page.inner_text("body")
+    if "LOGIN DE ACESSO" not in body.upper():
+        print("[sync] No login screen detected; continuing with public regional report")
+        return True
+
     await _select_partner(page)
 
     visible_inputs = page.locator("input:visible")
@@ -126,13 +131,18 @@ async def _collect_all_ceps(page) -> set[str]:
     collected: set[str] = set()
     idle_count = 0
     while idle_count < MAX_IDLE_SCROLLS:
-        slicer_texts = page.locator(".slicerText:visible")
-        count = await slicer_texts.count()
+        value_locators = (
+            page.locator(".slicerText:visible"),
+            page.locator("[role='option']:visible"),
+        )
         before = len(collected)
-        for i in range(count):
-            text = (await slicer_texts.nth(i).inner_text()).strip()
-            if CEP_PATTERN.match(text):
-                collected.add(text)
+        for values in value_locators:
+            count = await values.count()
+            for i in range(count):
+                text = (await values.nth(i).inner_text()).strip()
+                for candidate in re.findall(r"\b\d{8}\b", text):
+                    if CEP_PATTERN.match(candidate):
+                        collected.add(candidate)
         new_items = len(collected) - before
         if new_items > 0:
             idle_count = 0
