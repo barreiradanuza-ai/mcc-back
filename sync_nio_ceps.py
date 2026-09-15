@@ -263,6 +263,8 @@ async def _collect_querydata_by_state(page, states: tuple[str, ...], audit: list
                     audit.append({"state": state, "start": None, "end": None,
                                   "count": len(values), "truncated": False,
                                   "depth": None, "status": "state-query"})
+                    if progress:
+                        progress(state, 1, 1, "consulta estadual", len(captured))
     finally:
         page.remove_listener("request", on_request)
         page.remove_listener("response", on_response)
