@@ -22,9 +22,15 @@ from playwright.async_api import async_playwright
 load_dotenv()
 
 POWERBI_URLS = (
-    "https://app.powerbi.com/view?r=eyJrIjoiYTUyMGYwNmUtYzdjZS00OTJmLWIyMTctMjVkNTI0MjM2YTExIiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
+    # Centro-Oeste
     "https://app.powerbi.com/view?r=eyJrIjoiYTMyMWI0MDQtODE4Ni00NjQ1LTgwNzAtNTA3YThmZWE2YWJiIiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
+    # Norte e Nordeste
+    "https://app.powerbi.com/view?r=eyJrIjoiN2I2Y2QzOTEtNjNlZi00YWYyLTliMDktMWIwYjFjYWEyOWE5IiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
+    # Sudeste
+    "https://app.powerbi.com/view?r=eyJrIjoiOGE5ZGI4ZjktN2NmMS00ZGI1LTkwZDItNTI1OWFkMTQ5ZWJhIiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
+    # Sul
     "https://app.powerbi.com/view?r=eyJrIjoiY2MyMTJjMjUtMWI2YS00MzAxLTg3N2ItNzAzZTJjN2FhNzg4IiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
+    # São Paulo
     "https://app.powerbi.com/view?r=eyJrIjoiODFlOTVjMWEtZTc3MC00NGUzLTk2NDYtMTlkZjg0NDM3NTZjIiwidCI6Ijg1YjI4NDIxLWQ0NWEtNGIwNy04ODlkLTI0YjUyOGM3ZjI1MCJ9",
 )
 NIO_PASS_1 = "6566"
@@ -60,12 +66,18 @@ async def _select_partner(page):
     user_dropdown = page.locator("div.slicer-dropdown-menu").first
     await user_dropdown.wait_for(state="visible", timeout=60000)
     await user_dropdown.click()
-    user_candidates = ("PILOTO", "Todos", "PARCEIRO")
+    option_scope = page.locator("[role='listbox'][aria-label='usuario']:visible")
+    if not await option_scope.count():
+        option_scope = page.locator("[role='listbox']:visible")
+    await option_scope.first.wait_for(state="visible", timeout=15000)
+    # The regional reports expose the complete coverage only for PARCEIRO.
+    # Never silently fall back to PILOTO/Todos, which can produce partial bases.
+    user_candidates = ("PARCEIRO",)
     for user_name in user_candidates:
         candidates = (
-            page.get_by_text(user_name, exact=True),
-            page.get_by_text(re.compile(rf"^\s*{re.escape(user_name)}\s*$", re.IGNORECASE)),
-            page.locator(f"text={user_name}"),
+            option_scope.get_by_role("option", name=user_name, exact=True),
+            option_scope.locator(".slicerItemContainer").filter(has_text=re.compile(rf"^\s*{re.escape(user_name)}\s*$", re.IGNORECASE)),
+            option_scope.get_by_text(user_name, exact=True),
         )
         for partner in candidates:
             if not await partner.count():
@@ -86,11 +98,12 @@ async def _login(page, report_url: str) -> bool:
     await page.goto(report_url, wait_until="domcontentloaded", timeout=90000)
     await _wait_for_report(page)
 
-    body = await page.inner_text("body")
-    if "LOGIN DE ACESSO" not in body.upper():
-        print("[sync] No login screen detected; continuing with public regional report")
+    body = (await page.inner_text("body")).upper()
+    if "LOGIN DE ACESSO" not in body:
+        print("[sync] Region already authenticated; skipping login")
         return True
 
+    print("[sync] Login screen detected; selecting PARCEIRO")
     await _select_partner(page)
 
     visible_inputs = page.locator("input:visible")
@@ -100,9 +113,17 @@ async def _login(page, report_url: str) -> bool:
         return False
     await visible_inputs.nth(0).fill(NIO_PASS_1)
     await visible_inputs.nth(1).fill(NIO_PASS_2)
-    await page.get_by_text("ENTRAR", exact=True).first.click()
-    await page.wait_for_timeout(15000)
-    return True
+    entrar = page.get_by_role("button", name=re.compile(r"^ENTRAR$", re.IGNORECASE))
+    if not await entrar.count():
+        entrar = page.get_by_text("ENTRAR", exact=True)
+    await entrar.first.click()
+    for _ in range(60):
+        await page.wait_for_timeout(2000)
+        body_after_login = (await page.inner_text("body")).upper()
+        if "LOGIN DE ACESSO" not in body_after_login:
+            print("[sync] Regional report login confirmed")
+            return True
+    raise RuntimeError("Regional report login did not complete after submitting credentials")
 
 
 async def _clear_report_filters(page):
