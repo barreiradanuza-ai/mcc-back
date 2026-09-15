@@ -66,7 +66,6 @@ async def _select_partner(page):
                 continue
     body = (await page.inner_text("body"))[:500].replace("\n", " | ")
     raise RuntimeError(f"PARCEIRO not found after opening user slicer: {body}")
-            return
 
 
 async def _login(page, report_url: str) -> bool:
