@@ -344,7 +344,7 @@ def _build_coverage_string(
     if has_tim and has_nio:
         return "Ofertas Tim Nio"
     if has_claro:
-        return f"Ofertas {claro_label}"
+        return "Ofertas Claro Promo" if claro_promo else "Ofertas Claro"
     if has_tim:
         return "Ofertas Tim"
     if has_nio:
