@@ -332,25 +332,24 @@ def _build_coverage_string(
     has_tim: bool,
     has_nio: bool,
 ) -> str:
-    """Map provider presence flags to the canonical coverage string."""
+    """Map provider presence flags to the exact automation offer labels."""
     claro_label = "Claro Promo" if claro_promo else "Claro"
-    has_any_claro = has_claro or claro_promo
 
-    if has_any_claro and has_tim and has_nio:
-        return f"{claro_label} e Tim e Nio"
-    if has_any_claro and has_tim:
-        return f"Tim e {claro_label}"
-    if has_any_claro and has_nio:
-        return f"Nio e {claro_label}"
+    if has_claro and has_tim and has_nio:
+        return f"Ofertas {claro_label} Tim Nio"
+    if has_claro and has_tim:
+        return f"Ofertas Tim {claro_label}"
+    if has_claro and has_nio:
+        return f"Ofertas Nio {claro_label}"
     if has_tim and has_nio:
-        return "Tim e Nio"
-    if has_any_claro:
-        return claro_label
+        return "Ofertas Tim Nio"
+    if has_claro:
+        return f"Ofertas {claro_label}"
     if has_tim:
-        return "Tim"
+        return "Ofertas Tim"
     if has_nio:
-        return "Nio"
-    return "Sem cobertura"
+        return "Ofertas Nio"
+    return "Ofertas Sem cobertura"
 
 
 def get_coverage_string(cep: str, number: str) -> str:
