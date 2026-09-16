@@ -1,7 +1,7 @@
 """
 Coverage checker and plan provider.
 Coverage is resolved from Postgres tables (populated via seed_db.py and sync_nio_ceps.py).
-Address/city resolution uses ViaCEP, with OpenCEP as a fallback.
+Address/city resolution uses the public OpenCEP API.
 """
 
 import json
@@ -35,42 +35,27 @@ def _clean_cep(cep: str) -> str:
     return digits.zfill(8)
 
 
-def _empty_address() -> dict:
-    return {"street": "", "neighborhood": "", "city": "", "state": ""}
-
-
-def _address_from_payload(data: dict) -> dict:
-    """Map ViaCEP/OpenCEP fields to the API's stable address shape."""
-    return {
-        "street": data.get("logradouro", "") or "",
-        "neighborhood": data.get("bairro", "") or "",
-        "city": data.get("localidade", "") or "",
-        "state": data.get("uf", "") or "",
-    }
-
-
-def _fetch_json(url: str) -> dict | None:
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "mcc-back/2.2"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-        return data if isinstance(data, dict) else None
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-
-
 def _fetch_address(cep: str) -> dict:
-    """Resolve every CEP via ViaCEP, falling back to OpenCEP if necessary."""
+    """Resolve CEP to address via OpenCEP. Returns empty strings on failure.
+    Accepts CEP with or without hyphen; formats for API call."""
+    # OpenCEP accepts both formats, but format with hyphen for consistency
     cep_digits = _clean_cep(cep)
     cep_formatted = f"{cep_digits[:5]}-{cep_digits[5:]}"
-    viacep = _fetch_json(f"https://viacep.com.br/ws/{cep_digits}/json/")
-    if viacep and not viacep.get("erro") and viacep.get("localidade"):
-        return _address_from_payload(viacep)
-
-    opencep = _fetch_json(f"https://opencep.com/v1/{cep_formatted}")
-    if opencep and not opencep.get("erro") and not opencep.get("error"):
-        return _address_from_payload(opencep)
-    return _empty_address()
+    url = f"https://opencep.com/v1/{cep_formatted}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "mcc-back/2.1"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        if not data or data.get("erro") or data.get("error"):
+            return {"street": "", "neighborhood": "", "city": "", "state": ""}
+        return {
+            "street": data.get("logradouro", ""),
+            "neighborhood": data.get("bairro", ""),
+            "city": data.get("localidade", ""),
+            "state": data.get("uf", ""),
+        }
+    except Exception:
+        return {"street": "", "neighborhood": "", "city": "", "state": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +122,7 @@ CLARO_PLANS = [
         "providerSlug": "claro",
         "providerLogo": "/logos/providers/claro.svg",
         "planName": "Claro 750 Mega",
-        "promoted": False,
+        "promoted": True,
         "badges": ["Fibra Óptica"],
         "downloadSpeed": 750,
         "downloadLabel": "750 Mega",
@@ -287,7 +272,7 @@ def search_plans(cep: str, number: str) -> dict:
     if not has_claro and not has_tim and not nio_coverage:
         return {"error": "CEP sem cobertura", "plans": []}
 
-    # ViaCEP identifies the city used by the Claro Promo campaign.
+    # Address lookup is best-effort — does not block plan results
     address = _fetch_address(cep_clean)
 
     city_normalized = _normalize(address["city"]) if address["city"] else ""
@@ -302,7 +287,6 @@ def search_plans(cep: str, number: str) -> dict:
                 plan["providerSlug"] = "claro-promo"
                 plan["providerName"] = "Claro Promo"
                 plan["id"] = plan["id"].replace("claro-", "claro-promo-")
-                plan["promoted"] = True
             plans.append(plan)
 
     if has_tim:
@@ -363,8 +347,10 @@ def get_coverage_string(cep: str, number: str) -> str:
     has_tim = cep_has_coverage(cep_clean, "ceps_tim")
     nio_coverage = cep_has_coverage(cep_clean, "ceps_nio")
 
-    address = _fetch_address(cep_clean)
-    city_normalized = _normalize(address["city"]) if address["city"] else ""
+    city_normalized = ""
+    if has_claro:
+        address = _fetch_address(cep_clean)
+        city_normalized = _normalize(address["city"]) if address["city"] else ""
 
     claro_promo = has_claro and bool(city_normalized) and city_is_promo(city_normalized)
 
