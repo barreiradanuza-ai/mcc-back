@@ -1,7 +1,7 @@
 """
 Coverage checker and plan provider.
 Coverage is resolved from Postgres tables (populated via seed_db.py and sync_nio_ceps.py).
-Address/city resolution uses the public OpenCEP API.
+Address/city resolution uses the public OpenCEP API with ViaCEP fallback.
 """
 
 import json
@@ -35,27 +35,45 @@ def _clean_cep(cep: str) -> str:
     return digits.zfill(8)
 
 
-def _fetch_address(cep: str) -> dict:
-    """Resolve CEP to address via OpenCEP. Returns empty strings on failure.
-    Accepts CEP with or without hyphen; formats for API call."""
-    # OpenCEP accepts both formats, but format with hyphen for consistency
-    cep_digits = _clean_cep(cep)
-    cep_formatted = f"{cep_digits[:5]}-{cep_digits[5:]}"
-    url = f"https://opencep.com/v1/{cep_formatted}"
+def _empty_address() -> dict:
+    return {"street": "", "neighborhood": "", "city": "", "state": ""}
+
+
+def _map_address(data: dict) -> dict:
+    """Map OpenCEP/ViaCEP payloads to the API's stable address shape."""
+    return {
+        "street": data.get("logradouro", "") or "",
+        "neighborhood": data.get("bairro", "") or "",
+        "city": data.get("localidade", "") or "",
+        "state": data.get("uf", "") or "",
+    }
+
+
+def _request_address_json(url: str) -> dict | None:
+    """Fetch an address payload without changing the existing API contract."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "mcc-back/2.1"})
+        req = urllib.request.Request(url, headers={"User-Agent": "mcc-back/2.2"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-        if not data or data.get("erro") or data.get("error"):
-            return {"street": "", "neighborhood": "", "city": "", "state": ""}
-        return {
-            "street": data.get("logradouro", ""),
-            "neighborhood": data.get("bairro", ""),
-            "city": data.get("localidade", ""),
-            "state": data.get("uf", ""),
-        }
-    except Exception:
-        return {"street": "", "neighborhood": "", "city": "", "state": ""}
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _fetch_address(cep: str) -> dict:
+    """Resolve CEP with OpenCEP first and ViaCEP as a fallback."""
+    cep_digits = _clean_cep(cep)
+    cep_formatted = f"{cep_digits[:5]}-{cep_digits[5:]}"
+    opencep = _request_address_json(f"https://opencep.com/v1/{cep_formatted}")
+    if opencep and not opencep.get("erro") and not opencep.get("error"):
+        address = _map_address(opencep)
+        if address["city"]:
+            return address
+
+    viacep = _request_address_json(f"https://viacep.com.br/ws/{cep_digits}/json/")
+    if viacep and not viacep.get("erro") and viacep.get("localidade"):
+        return _map_address(viacep)
+    return _empty_address()
 
 
 # ---------------------------------------------------------------------------
