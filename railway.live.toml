@@ -1,0 +1,12 @@
+# Railway service separado para consulta online de fachadas NIO.
+# Crie um serviço apontando para este repositório e use este start command:
+# uvicorn nio_live_service:app --host 0.0.0.0 --port ${PORT:-8080}
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+[deploy]
+startCommand = "uvicorn nio_live_service:app --host 0.0.0.0 --port ${PORT:-8080}"
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
