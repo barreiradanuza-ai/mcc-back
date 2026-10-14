@@ -15,11 +15,9 @@ from db import cep_has_coverage, city_is_promo
 RJ_CEP_MIN = 20000000
 RJ_CEP_MAX = 28999999
 
-
 def _normalize(text: str) -> str:
     """Uppercase + strip accents for city name comparison."""
     return unicodedata.normalize("NFD", text.upper()).encode("ascii", "ignore").decode().strip()
-
 
 def _is_rj_cep(cep: str) -> bool:
     """RJ state CEPs range from 20000-000 to 28999-999."""
@@ -28,16 +26,13 @@ def _is_rj_cep(cep: str) -> bool:
     except ValueError:
         return False
 
-
 def _clean_cep(cep: str) -> str:
     """Remove all non-digit characters and zero-pad to 8 digits."""
     digits = re.sub(r"\D", "", cep)
     return digits.zfill(8)
 
-
 def _empty_address() -> dict:
     return {"street": "", "neighborhood": "", "city": "", "state": ""}
-
 
 def _map_address(data: dict) -> dict:
     """Map OpenCEP/ViaCEP payloads to the API's stable address shape."""
@@ -48,7 +43,6 @@ def _map_address(data: dict) -> dict:
         "state": data.get("uf", "") or "",
     }
 
-
 def _request_address_json(url: str) -> dict | None:
     """Fetch an address payload without changing the existing API contract."""
     try:
@@ -58,7 +52,6 @@ def _request_address_json(url: str) -> dict | None:
         return data if isinstance(data, dict) else None
     except (OSError, ValueError, json.JSONDecodeError):
         return None
-
 
 def _fetch_address(cep: str) -> dict:
     """Resolve CEP with OpenCEP first and ViaCEP as a fallback."""
@@ -74,7 +67,6 @@ def _fetch_address(cep: str) -> dict:
     if viacep and not viacep.get("erro") and viacep.get("localidade"):
         return _map_address(viacep)
     return _empty_address()
-
 
 # ---------------------------------------------------------------------------
 # Static plan definitions
@@ -272,7 +264,6 @@ NIO_PLANS = [
     },
 ]
 
-
 # ---------------------------------------------------------------------------
 # Main search logic
 # ---------------------------------------------------------------------------
@@ -294,7 +285,7 @@ def search_plans(cep: str, number: str) -> dict:
     address = _fetch_address(cep_clean)
 
     city_normalized = _normalize(address["city"]) if address["city"] else ""
-    claro_promo = has_claro and bool(city_normalized) and city_is_promo(city_normalized)
+    claro_promo = nio_coverage and bool(city_normalized) and city_is_promo(city_normalized)
 
     plans: list[dict] = []
 
@@ -327,7 +318,6 @@ def search_plans(cep: str, number: str) -> dict:
         "nioCoverage": nio_coverage,
     }
 
-
 def _build_coverage_string(
     has_claro: bool,
     claro_promo: bool,
@@ -354,7 +344,6 @@ def _build_coverage_string(
         return "Nio"
     return "Sem cobertura"
 
-
 def get_coverage_string(cep: str, number: str) -> str:
     """Return a human-readable coverage string for the given address."""
     cep_clean = _clean_cep(cep)
@@ -366,14 +355,13 @@ def get_coverage_string(cep: str, number: str) -> str:
     nio_coverage = cep_has_coverage(cep_clean, "ceps_nio")
 
     city_normalized = ""
-    if has_claro:
+    if nio_coverage:
         address = _fetch_address(cep_clean)
         city_normalized = _normalize(address["city"]) if address["city"] else ""
 
-    claro_promo = has_claro and bool(city_normalized) and city_is_promo(city_normalized)
+    claro_promo = nio_coverage and bool(city_normalized) and city_is_promo(city_normalized)
 
     return _build_coverage_string(has_claro, claro_promo, has_tim, nio_coverage)
-
 
 if __name__ == "__main__":
     import sys
